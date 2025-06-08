@@ -1,82 +1,69 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import (
-    col, count, countDistinct, isnan, when, mean, stddev, min, max, lit
-)
-import pandas as pd
-from datetime import datetime
+from pyspark.sql.functions import col, when, count, countDistinct, isnan, mean, stddev, min, max, lit
+from pyspark.sql.types import StringType
 
-# Initialize Spark
 spark = SparkSession.builder \
-    .appName("Customer Table Profiler") \
+    .appName("Customer Table Profiling") \
     .enableHiveSupport() \
     .getOrCreate()
 
-# Load table
-table = "app.customer"
-df = spark.table(table)
+source_table = "app.customer"
+output_table = "app.customer_profile"
 
-# Get list of numeric columns
-numeric_types = ["int", "bigint", "float", "double", "decimal"]
-columns = df.dtypes
+df = spark.table(source_table)
 
-# List of countries
-countries = [row["country"] for row in df.select("country").distinct().collect()]
+# Get list of countries
+countries = df.select("country").distinct().rdd.flatMap(lambda x: x).collect()
 
-# Final profiling result
 all_profiles = []
 
 for country in countries:
     df_country = df.filter(col("country") == country)
     total_rows = df_country.count()
-
-    for col_name, dtype in columns:
+    
+    for col_name, dtype in df_country.dtypes:
         if col_name == "country":
-            continue  # skip country column since it's grouping key
-
+            continue
+        
+        col_data = df_country.select(col(col_name))
         null_count = df_country.filter(col(col_name).isNull() | isnan(col(col_name))).count()
-        null_pct = null_count / total_rows if total_rows > 0 else None
-        distinct_count = df_country.select(col_name).distinct().count()
-
-        profile = {
-            "country": country,
-            "column": col_name,
-            "type": dtype,
-            "null_count": null_count,
-            "null_pct": round(null_pct, 4) if null_pct is not None else None,
-            "distinct_count": distinct_count,
-        }
-
-        if dtype in numeric_types:
+        distinct_count = col_data.distinct().count()
+        null_pct = null_count / total_rows if total_rows else None
+        
+        # Numeric stats
+        if dtype in ["int", "double", "float", "bigint", "decimal"]:
             stats = df_country.select(
                 mean(col(col_name)).alias("mean"),
                 stddev(col(col_name)).alias("stddev"),
                 min(col(col_name)).alias("min"),
                 max(col(col_name)).alias("max")
             ).first()
-
-            profile["mean"] = round(stats["mean"], 2) if stats["mean"] is not None else None
-            profile["stddev"] = round(stats["stddev"], 2) if stats["stddev"] is not None else None
-            profile["min"] = stats["min"]
-            profile["max"] = stats["max"]
+            row = (
+                country, col_name, dtype,
+                null_count, null_pct, distinct_count,
+                stats["mean"], stats["stddev"], stats["min"], stats["max"]
+            )
         else:
-            profile["mean"] = None
-            profile["stddev"] = None
-            profile["min"] = None
-            profile["max"] = None
-
-        all_profiles.append(profile)
+            row = (
+                country, col_name, dtype,
+                null_count, null_pct, distinct_count,
+                None, None, None, None
+            )
+        
+        all_profiles.append(row)
 
 # Convert to DataFrame
-profile_df = spark.createDataFrame(all_profiles)
+schema = ["country", "column", "type", "null_count", "null_pct", "distinct_count", "mean", "stddev", "min", "max"]
+profile_df = spark.createDataFrame(all_profiles, schema)
 
-# Save to Hive table (overwrite daily)
-profile_df.write.mode("overwrite").saveAsTable("app.customer_profile")
+# Save as Hive table
+profile_df.write.mode("overwrite").saveAsTable(output_table)
 
-# Save as HTML report
-local_df = profile_df.toPandas()
-today = datetime.today().strftime("%Y-%m-%d")
-html_path = f"/tmp/customer_profile_report_{today}.html"
-local_df.to_html(html_path, index=False, border=0, justify="center")
+# Save to HDFS as HTML-friendly CSV (can be served from web if needed)
+profile_df.orderBy("country", "column") \
+    .coalesce(1) \
+    .write.mode("overwrite") \
+    .option("header", True) \
+    .csv("/tmp/customer_profile_report/")
 
-print(f"✔ Profile saved to Hive table: app.customer_profile")
-print(f"✔ HTML report saved to: {html_path}")
+print("✅ Profiling completed. Saved to Hive and /tmp/customer_profile_report/")
